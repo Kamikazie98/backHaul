@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,67 +15,76 @@ GITHUB_REPO="Kamikazie98/backHaul"
 
 # Function to check if script is run as root
 check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}Please run as root${NC}"
+    if [ "$(id -u)" -ne 0 ]; then
+        printf "${RED}Please run as root${NC}\n"
         exit 1
     fi
 }
 
 # Function to install dependencies
 install_dependencies() {
-    echo -e "${BLUE}Installing dependencies...${NC}"
-    if command -v apt-get &> /dev/null; then
+    printf "${BLUE}Installing dependencies...${NC}\n"
+    if command -v apt-get > /dev/null 2>&1; then
         apt-get update
         apt-get install -y curl wget unzip
-    elif command -v yum &> /dev/null; then
+    elif command -v yum > /dev/null 2>&1; then
         yum install -y curl wget unzip
     else
-        echo -e "${RED}Unsupported package manager. Please install curl, wget_ABORTIVE and unzip manually.${NC}"
+        printf "${RED}Unsupported package manager. Please install curl, wget and unzip manually.${NC}\n"
         exit 1
     fi
 }
 
 # Function to download latest release
 download_latest() {
-    echo -e "${BLUE}Downloading latest version...${NC}"
+    printf "${BLUE}Downloading latest version...${NC}\n"
     
     # Determine system architecture
     ARCH=$(uname -m)
-    case "$ARCH" in
+    case "${ARCH}" in
         x86_64) ARCH="amd64" ;;
         aarch64) ARCH="arm64" ;;
-        *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; exit 1 ;;
+        *) printf "${RED}Unsupported architecture: ${ARCH}${NC}\n"; exit 1 ;;
     esac
     
     # Create installation directory
-    mkdir -p "$INSTALL_DIR"
+    mkdir -p "${INSTALL_DIR}"
     
     # Download latest release
-    LATEST_VERSION=$(curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-    if [ -z "$LATEST_VERSION" ]; then
-        echo -e "${RED}Failed to fetch latest version from GitHub${NC}"
+    LATEST_VERSION=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -z "${LATEST_VERSION}" ]; then
+        printf "${RED}Failed to fetch latest version from GitHub${NC}\n"
         exit 1
     fi
-    wget -O /tmp/backhaul.tar.gz "https://github.com/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/backhaul_linux_${ARCH}.tar.gz"
     
-    tar xzf /tmp/backhaul.tar.gz -C "$INSTALL_DIR"
-    rm /tmp/backhaul.tar.gz
+    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/backhaul_linux_${ARCH}.tar.gz"
+    if ! wget -O "/tmp/backhaul.tar.gz" "${DOWNLOAD_URL}"; then
+        printf "${RED}Failed to download release${NC}\n"
+        exit 1
+    fi
     
-    chmod +x "$INSTALL_DIR/backhaul"
+    if ! tar xzf "/tmp/backhaul.tar.gz" -C "${INSTALL_DIR}"; then
+        printf "${RED}Failed to extract archive${NC}\n"
+        rm -f "/tmp/backhaul.tar.gz"
+        exit 1
+    fi
+    
+    rm -f "/tmp/backhaul.tar.gz"
+    chmod +x "${INSTALL_DIR}/backhaul"
 }
 
 # Function to create systemd service
 create_service() {
     check_root
-    echo -e "${BLUE}Creating systemd service...${NC}"
-    cat > /etc/systemd/system/${SERVICE_NAME}.service << EOF
+    printf "${BLUE}Creating systemd service...${NC}\n"
+    cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
 [Unit]
 Description=Backhaul Tunnel Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/backhaul -c $CONFIG_DIR/config.toml
+ExecStart=${INSTALL_DIR}/backhaul -c ${CONFIG_DIR}/config.toml
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -90,25 +99,28 @@ EOF
 # Function to create a new tunnel configuration
 create_tunnel() {
     check_root
-    echo -e "${BLUE}Creating new tunnel configuration...${NC}"
+    printf "${BLUE}Creating new tunnel configuration...${NC}\n"
     
-    read -p "Is this a server or client? [s/c]: " TYPE
-    if [[ "$TYPE" != "s" && "$TYPE" != "c" ]]; then
-        echo -e "${RED}Invalid type. Please choose 's' for server or 'c' for client${NC}"
+    printf "Is this a server or client? [s/c]: "
+    read -r TYPE
+    if [ "${TYPE}" != "s" ] && [ "${TYPE}" != "c" ]; then
+        printf "${RED}Invalid type. Please choose 's' for server or 'c' for client${NC}\n"
         return 1
     fi
     
-    read -p "Enter configuration name (e.g., mytunnel): " CONFIG_NAME
-    if [ -z "$CONFIG_NAME" ]; then
-        echo -e "${RED}Configuration name cannot be empty${NC}"
+    printf "Enter configuration name (e.g., mytunnel): "
+    read -r CONFIG_NAME
+    if [ -z "${CONFIG_NAME}" ]; then
+        printf "${RED}Configuration name cannot be empty${NC}\n"
         return 1
     fi
     
-    CONFIG_FILE="$CONFIG_DIR/${CONFIG_NAME}.toml"
+    CONFIG_FILE="${CONFIG_DIR}/${CONFIG_NAME}.toml"
+    mkdir -p "${CONFIG_DIR}"
     
-    if [ "$TYPE" = "s" ]; then
+    if [ "${TYPE}" = "s" ]; then
         # Prompt for server configuration parameters
-        echo -e "${BLUE}Enter server configuration parameters:${NC}"
+        printf "${BLUE}Enter server configuration parameters:${NC}\n"
         read -p "Bind address (e.g., 0.0.0.0:3080): " BIND_ADDR
         BIND_ADDR=${BIND_ADDR:-"0.0.0.0:3080"}
         read -p "Transport protocol (tcp, tcpmux, ws, wss, wsmux, wssmux) [default: tcp]: " TRANSPORT
@@ -149,8 +161,8 @@ create_tunnel() {
         LOG_LEVEL=${LOG_LEVEL:-"info"}
         
         # Prompt for port mappings
-        echo -e "${BLUE}Enter port mappings (one per line, press Enter twice to finish):${NC}"
-        echo -e "${YELLOW}Format examples: '443', '443-600', '443-600:5201', '443=1.1.1.1:5201', '127.0.0.2:443=1.1.1.1:5201'${NC}"
+        printf "${BLUE}Enter port mappings (one per line, press Enter twice to finish):${NC}\n"
+        printf "${YELLOW}Format examples: '443', '443-600', '443-600:5201', '443=1.1.1.1:5201', '127.0.0.2:443=1.1.1.1:5201'${NC}\n"
         PORTS=""
         while IFS= read -r PORT; do
             [[ -z "$PORT" ]] && break
@@ -184,11 +196,11 @@ ports = [
 $PORTS
 ]
 EOF
-        echo -e "${GREEN}Created server configuration: $CONFIG_FILE${NC}"
+        printf "${GREEN}Created server configuration: $CONFIG_FILE${NC}\n"
         
     else
         # Prompt for client configuration parameters
-        echo -e "${BLUE}Enter client configuration parameters:${NC}"
+        printf "${BLUE}Enter client configuration parameters:${NC}\n"
         read -p "Remote server address (e.g., your_server_ip:3080): " REMOTE_ADDR
         REMOTE_ADDR=${REMOTE_ADDR:-"your_server_ip:3080"}
         read -p "Edge IP for CDN (e.g., 188.114.96.0, optional): " EDGE_IP
@@ -248,13 +260,13 @@ web_port = $WEB_PORT
 sniffer_log = "$SNIFFER_LOG"
 log_level = "$LOG_LEVEL"
 EOF
-        echo -e "${GREEN}Created client configuration: $CONFIG_FILE${NC}"
+        printf "${GREEN}Created client configuration: $CONFIG_FILE${NC}\n"
     fi
     
     # Copy to default config for service
     cp "$CONFIG_FILE" "$CONFIG_DIR/config.toml"
-    echo -e "${YELLOW}Configuration saved. You can edit $CONFIG_FILE manually if needed.${NC}"
-    echo -e "${YELLOW}Use './backhaul.sh manage start' to start the tunnel.${NC}"
+    printf "${YELLOW}Configuration saved. You can edit $CONFIG_FILE manually if needed.${NC}\n"
+    printf "${YELLOW}Use './backhaul.sh manage start' to start the tunnel.${NC}\n"
 }
 
 # Function to install Backhaul
@@ -264,8 +276,8 @@ install() {
     download_latest
     create_service
     
-    echo -e "${GREEN}Installation completed!${NC}"
-    echo -e "Run './backhaul.sh create' to create a new tunnel configuration."
+    printf "${GREEN}Installation completed!${NC}\n"
+    printf "Run './backhaul.sh create' to create a new tunnel configuration.\n"
 }
 
 # Function to manage tunnels
@@ -274,25 +286,25 @@ manage_tunnel() {
     
     case "$1" in
         start)
-            systemctl start ${SERVICE_NAME}
-            echo -e "${GREEN}Started Backhaul service${NC}"
+            systemctl start "${SERVICE_NAME}"
+            printf "${GREEN}Started Backhaul service${NC}\n"
             ;;
         stop)
-            systemctl stop ${SERVICE_NAME}
-            echo -e "${YELLOW}Stopped Backhaul service${NC}"
+            systemctl stop "${SERVICE_NAME}"
+            printf "${YELLOW}Stopped Backhaul service${NC}\n"
             ;;
         restart)
-            systemctl restart ${SERVICE_NAME}
-            echo -e "${GREEN}Restarted Backhaul service${NC}"
+            systemctl restart "${SERVICE_NAME}"
+            printf "${GREEN}Restarted Backhaul service${NC}\n"
             ;;
         status)
-            systemctl status ${SERVICE_NAME}
+            systemctl status "${SERVICE_NAME}"
             ;;
         logs)
-            journalctl -u ${SERVICE_NAME} -f
+            journalctl -u "${SERVICE_NAME}" -f
             ;;
         *)
-            echo -e "${RED}Usage: $0 manage [start|stop|restart|status|logs]${NC}"
+            printf "${RED}Usage: %s manage [start|stop|restart|status|logs]${NC}\n" "$0"
             exit 1
             ;;
     esac
@@ -302,16 +314,16 @@ manage_tunnel() {
 uninstall() {
     check_root
     
-    echo -e "${YELLOW}Uninstalling Backhaul...${NC}"
+    printf "${YELLOW}Uninstalling Backhaul...${NC}\n"
     
-    systemctl stop ${SERVICE_NAME} 2>/dev/null
-    systemctl disable ${SERVICE_NAME} 2>/dev/null
-    rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null
+    systemctl disable "${SERVICE_NAME}" 2>/dev/null
+    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
     systemctl daemon-reload
     
-    rm -rf "$INSTALL_DIR"
-    rm -rf "$CONFIG_DIR"
-    echo -e "${GREEN}Uninstallation completed${NC}"
+    rm -rf "${INSTALL_DIR}"
+    rm -rf "${CONFIG_DIR}"
+    printf "${GREEN}Uninstallation completed${NC}\n"
 }
 
 # Main script logic
@@ -329,12 +341,12 @@ case "$1" in
         uninstall
         ;;
     *)
-        echo -e "${BLUE}Usage: $0 {install|create|manage|uninstall}${NC}"
-        echo -e "\nCommands:"
-        echo -e "  ${YELLOW}install${NC}    Install Backhaul"
-        echo -e "  ${YELLOW}create${NC}     Create a new tunnel configuration (server or client)"
-        echo -e "  ${YELLOW}manage${NC}     Manage tunnel service (start|stop|restart|status|logs)"
-        echo -e "  ${YELLOW}uninstall${NC}  Remove Backhaul"
+        printf "${BLUE}Usage: %s {install|create|manage|uninstall}${NC}\n" "$0"
+        printf "\nCommands:\n"
+        printf "  ${YELLOW}install${NC}    Install Backhaul\n"
+        printf "  ${YELLOW}create${NC}     Create a new tunnel configuration (server or client)\n"
+        printf "  ${YELLOW}manage${NC}     Manage tunnel service (start|stop|restart|status|logs)\n"
+        printf "  ${YELLOW}uninstall${NC}  Remove Backhaul\n"
         exit 1
         ;;
 esac
