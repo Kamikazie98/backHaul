@@ -69,8 +69,11 @@ download_latest() {
         exit 1
     fi
     
-    rm -f "/tmp/backhaul.tar.gz"
+    # Rename the binary to just 'backhaul' and set permissions
+    mv "${INSTALL_DIR}/backhaul_linux_${ARCH}" "${INSTALL_DIR}/backhaul"
     chmod +x "${INSTALL_DIR}/backhaul"
+    
+    rm -f "/tmp/backhaul.tar.gz"
 }
 
 # Function to create systemd service
