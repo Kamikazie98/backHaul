@@ -69,9 +69,15 @@ download_latest() {
         exit 1
     fi
     
-    # Rename the binary to just 'backhaul' and set permissions
-    mv "${INSTALL_DIR}/backhaul_linux_${ARCH}" "${INSTALL_DIR}/backhaul"
-    chmod +x "${INSTALL_DIR}/backhaul"
+    # Find and rename the binary
+    BINARY_PATH=$(find "${INSTALL_DIR}" -name "backhaul_linux_${ARCH}*" -type f)
+    if [ -n "${BINARY_PATH}" ]; then
+        mv "${BINARY_PATH}" "${INSTALL_DIR}/backhaul"
+        chmod +x "${INSTALL_DIR}/backhaul"
+    else
+        printf "${RED}Could not find binary file in extracted archive${NC}\n"
+        exit 1
+    fi
     
     rm -f "/tmp/backhaul.tar.gz"
 }
@@ -165,7 +171,7 @@ create_tunnel() {
         
         # Prompt for port mappings
         printf "${BLUE}Enter port mappings (one per line, press Enter twice to finish):${NC}\n"
-        printf "${YELLOW}Format examples: '443', '443-600', '443-600:5201', '443=1.1.1.1:5201', '127.0.0.2:443=1.1.1.1:5201'${NC}\n"
+        printf "${YELLOW}Format examples: '443', '443-600', '443-600:5201', '443=1.1.1.1:5201', '127.0.0.2:443=1.1.1.1:5201'${NC}"
         PORTS=""
         while IFS= read -r PORT; do
             [[ -z "$PORT" ]] && break
