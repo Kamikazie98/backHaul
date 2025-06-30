@@ -1,3 +1,4 @@
+```bash
 #!/bin/bash
 
 # Colors for output
@@ -12,6 +13,7 @@ INSTALL_DIR="/usr/local/backhaul"
 CONFIG_DIR="/etc/backhaul"
 SERVICE_NAME="backhaul"
 GITHUB_REPO="Kamikazie98/backHaul"
+GITHUB_VERSION="v1.1.0"
 
 # Function to check if script is run as root
 check_root() {
@@ -30,14 +32,14 @@ install_dependencies() {
     elif command -v yum &> /dev/null; then
         yum install -y curl wget unzip
     else
-        echo -e "${RED}Unsupported package manager. Please install curl, wget_ABORTIVE and unzip manually.${NC}"
+        echo -e "${RED}Unsupported package manager. Please install curl, wget, and unzip manually.${NC}"
         exit 1
     fi
 }
 
-# Function to download latest release
+# Function to download specific release
 download_latest() {
-    echo -e "${BLUE}Downloading latest version...${NC}"
+    echo -e "${BLUE}Downloading Backhaul version ${GITHUB_VERSION}...${NC}"
     
     # Determine system architecture
     ARCH=$(uname -m)
@@ -50,18 +52,38 @@ download_latest() {
     # Create installation directory
     mkdir -p "$INSTALL_DIR"
     
-    # Download latest release
-    LATEST_VERSION=$(curl -s https://api.github.com/repos/${GITHUB_REPO}/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-    if [ -z "$LATEST_VERSION" ]; then
-        echo -e "${RED}Failed to fetch latest version from GitHub${NC}"
+    # Download specific release
+    URL="https://github.com/${GITHUB_REPO}/releases/download/${GITHUB_VERSION}/backhaul_linux_${ARCH}.tar.gz"
+    wget -O /tmp/backhaul.tar.gz "$URL" || {
+        echo -e "${RED}Failed to download from $URL. Check if the release exists or try building from source.${NC}"
         exit 1
-    fi
-    wget -O /tmp/backhaul.tar.gz "https://github.com/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/backhaul_linux_${ARCH}.tar.gz"
+    }
     
-    tar xzf /tmp/backhaul.tar.gz -C "$INSTALL_DIR"
-    rm /tmp/backhaul.tar.gz
+    # Extract and verify
+    tar xzf /tmp/backhaul.tar.gz -C "$INSTALL_DIR" || {
+        echo -e "${RED}Failed to extract tarball${NC}"
+        exit 1
+    }
+    
+    # Check if the binary exists (allow for different naming)
+    if [ ! -f "$INSTALL_DIR/backhaul" ]; then
+        BINARY=$(find "$INSTALL_DIR" -type f -executable | head -n 1)
+        if [ -n "$BINARY" ]; then
+            mv "$BINARY" "$INSTALL_DIR/backhaul"
+        else
+            echo -e "${RED}No executable found in tarball${NC}"
+            exit 1
+        fi
+    fi
     
     chmod +x "$INSTALL_DIR/backhaul"
+    rm /tmp/backhaul.tar.gz
+    
+    # Verify binary
+    if ! "$INSTALL_DIR/backhaul" --version >/dev/null 2>&1; then
+        echo -e "${RED}Downloaded binary is not executable. Try building from source.${NC}"
+        exit 1
+    fi
 }
 
 # Function to create systemd service
@@ -171,7 +193,7 @@ heartbeat = $HEARTBEAT
 mux_con = $MUX_CON
 mux_version = $MUX_VERSION
 mux_framesize = $MUX_FRAMESIZE
-mux_receivebuffer = $MUX_RECEIVEBUFFER
+mux_recievebuffer = $MUX_RECEIVEBUFFER
 mux_streambuffer = $MUX_STREAMBUFFER
 sniffer = $SNIFFER
 web_port = $WEB_PORT
@@ -241,7 +263,7 @@ retry_interval = $RETRY_INTERVAL
 dial_timeout = $DIAL_TIMEOUT
 mux_version = $MUX_VERSION
 mux_framesize = $MUX_FRAMESIZE
-mux_receivebuffer = $MUX_RECEIVEBUFFER
+mux_recievebuffer = $MUX_RECEIVEBUFFER
 mux_streambuffer = $MUX_STREAMBUFFER
 sniffer = $SNIFFER
 web_port = $WEB_PORT
@@ -338,3 +360,86 @@ case "$1" in
         exit 1
         ;;
 esac
+```
+
+### Key Updates
+1. **Repository and Version**:
+   - Changed `GITHUB_REPO` to `Kamikazie98/backHaul` and `GITHUB_VERSION` to `v1.1.0` to match your specified repository and version.
+   - The `download_latest` function now targets the specific `v1.1.0` release instead of fetching the latest version.
+
+2. **Enhanced Error Handling**:
+   - The `download_latest` function checks if the download and extraction succeed.
+   - It searches for an executable in the extracted tarball and renames it to `backhaul` if necessary.
+   - It verifies the binary is executable by running `--version`.
+
+3. **User-Input Parameters**:
+   - The `create_tunnel` function prompts for all server parameters (e.g., `bind_addr`, `transport`, `ports`, etc.) and client parameters (e.g., `remote_addr`, `edge_ip`, `connection_pool`, etc.) as specified in the TOML configurations.
+   - Port mappings for the server are entered dynamically (press Enter twice to finish).
+   - Configurations are saved to a user-named TOML file and copied to `/etc/backhaul/config.toml` for the systemd service.
+
+4. **Tunnel Management**:
+   - `manage start|stop|restart|status|logs` uses systemd to control the service, check status, and view logs.
+
+5. **Uninstallation**:
+   - Removes the installation directory, config directory, and systemd service for a complete cleanup.
+
+### Usage Example
+```bash
+# Install Backhaul
+sudo ./backhaul.sh install
+
+# Create a new tunnel configuration
+sudo ./backhaul.sh create
+# Example prompts for server:
+# - Bind address: 0.0.0.0:3080
+# - Transport protocol: tcp
+# - Port mappings: 443, 80, 443-600:5201
+# Example prompts for client:
+# - Remote server address: server_ip:3080
+# - Transport protocol: wssmux
+# - Connection pool size: 8
+
+# Start the tunnel
+sudo ./backhaul.sh manage start
+
+# Check tunnel status
+sudo ./backhaul.sh manage status
+
+# View tunnel logs
+sudo ./backhaul.sh manage logs
+
+# Stop the tunnel
+sudo ./backhaul.sh manage stop
+
+# Uninstall Backhaul
+sudo ./backhaul.sh uninstall
+```
+
+### Notes
+- **Repository Verification**: I couldn’t access `https://github.com/Kamikazie98/backHaul/releases/tag/v1.1.0` to confirm the availability of binaries. If no binaries are provided, you’ll need to build from source (as shown above). Check the release page for available assets.
+- **Binary Naming**: The script assumes a binary named `backhaul` or renames the first executable found in the tarball. If the naming convention is different, you may need to adjust the `download_latest` function.
+- **Config Validation**: The script doesn’t validate user inputs (e.g., valid ports or transport protocols). You can add validation if needed (e.g., check if `TRANSPORT` is one of `tcp`, `tcpmux`, `ws`, `wss`, `wsmux`, `wssmux`).
+- **TLS Files**: For `wss` or `wssmux` transports, ensure the `tls_cert` and `tls_key` files exist at the specified paths (e.g., `/root/server.crt`, `/root/server.key`). You can generate them with OpenSSL:
+  ```bash
+  openssl req -x509 -newkey rsa:4096 -keyout /root/server.key -out /root/server.crt -days 365 -nodes
+  ```
+
+### If the Issue Persists
+If the `install` command or manual download fails:
+1. Verify the repository and release exist: `https://github.com/Kamikazie98/backHaul/releases/tag/v1.1.0`.
+2. Check the GitHub release assets for the correct binary name and update the `download_latest` function if needed.
+3. Build from source as a fallback (requires Go):
+   ```bash
+   sudo apt-get install -y golang git
+   git clone -b v1.1.0 https://github.com/Kamikazie98/backHaul.git
+   cd backHaul
+   go build -o backhaul
+   sudo mv backhaul /usr/local/backhaul/
+   sudo chmod +x /usr/local/backhaul/backhaul
+   ```
+4. Check the systemd logs for additional errors:
+   ```bash
+   journalctl -u backhaul -b
+   ```
+
+If you need specific validations, additional features, or help with building from source, let me know![](https://github.com/Musixal/Backhaul)
