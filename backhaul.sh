@@ -11,7 +11,7 @@ NC='\033[0m' # No Color
 INSTALL_DIR="/usr/local/backhaul"
 CONFIG_DIR="/etc/backhaul"
 SERVICE_NAME="backhaul"
-GITHUB_REPO="musixal/backhaul"
+GITHUB_REPO="Kamikazie98/backHaul"
 
 # Function to check if script is run as root
 check_root() {
