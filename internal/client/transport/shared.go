@@ -15,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/musix/backhaul/internal/config"
 	"golang.org/x/exp/rand"
+	"github.com/musix/backhaul/internal/utils"
 )
 
 func ResolveRemoteAddr(remoteAddr string) (int, string, error) {
@@ -43,32 +44,32 @@ func ResolveRemoteAddr(remoteAddr string) (int, string, error) {
 	return port, remoteAddr, nil
 }
 
-func TcpDialer(ctx context.Context, address string, timeout time.Duration, keepAlive time.Duration, nodelay bool, retry int, SO_RCVBUF int, SO_SNDBUF int) (*net.TCPConn, error) {
-	var tcpConn *net.TCPConn
+func TcpDialer(ctx context.Context, addr string, dialTimeout time.Duration, keepalive time.Duration, nodelay bool, retries int, writeBuffer, readBuffer int) (net.Conn, error) {
+	var d net.Dialer
+	d.Timeout = dialTimeout
+
+	var conn net.Conn
 	var err error
 
-	retries := retry           // Number of retries
-	backoff := 1 * time.Second // Initial backoff duration
-
 	for i := 0; i < retries; i++ {
-		// Attempt to establish a TCP connection
-		tcpConn, err = attemptTcpDialer(ctx, address, timeout, keepAlive, nodelay, SO_RCVBUF, SO_SNDBUF)
-		if err == nil {
-			// Connection successful
-			return tcpConn, nil
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			conn, err = d.Dial("tcp", addr)
+			if err == nil {
+				// Set socket options using the platform-specific implementation
+				err = setSocketOptions(conn, nodelay, keepalive, writeBuffer, readBuffer)
+				if err != nil {
+					conn.Close()
+					return nil, fmt.Errorf("failed to set socket options: %v", err)
+				}
+				return conn, nil
+			}
+			time.Sleep(time.Second)
 		}
-
-		// If this is the last retry, return the error
-		if i == retries-1 {
-			break
-		}
-
-		// Log retry attempt and wait before retrying
-		time.Sleep(backoff)
-		backoff *= 2 // Exponential backoff (double the wait time after each failure)
 	}
-
-	return nil, err
+	return nil, fmt.Errorf("failed to connect after %d retries: %v", retries, err)
 }
 
 func attemptTcpDialer(ctx context.Context, address string, timeout time.Duration, keepAlive time.Duration, nodelay bool, SO_RCVBUF int, SO_SNDBUF int) (*net.TCPConn, error) {
@@ -306,4 +307,23 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		return nil, err
 	}
 	return tunnelWSConn, nil
+}
+
+func validateSignal(signal byte) bool {
+	validSignals := []byte{
+		utils.SG_HB,     // Heartbeat
+		utils.SG_Chan,   // Channel
+		utils.SG_Ping,   // Ping
+		utils.SG_Closed, // Closed
+		utils.SG_TCP,    // TCP
+		utils.SG_UDP,    // UDP
+		utils.SG_RTT,    // RTT
+	}
+
+	for _, validSignal := range validSignals {
+		if signal == validSignal {
+			return true
+		}
+	}
+	return false
 }

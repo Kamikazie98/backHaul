@@ -26,6 +26,8 @@ type TcpTransport struct {
 	poolConnections int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	trafficBalancer *utils.TrafficBalancer
+	trafficObfuscator *utils.TrafficObfuscator
 }
 type TcpConfig struct {
 	RemoteAddr     string
@@ -53,11 +55,13 @@ func NewTCPClient(parentCtx context.Context, config *TcpConfig, logger *logrus.L
 		ctx:             ctx,
 		cancel:          cancel,
 		logger:          logger,
-		controlChannel:  nil, // will be set when a control connection is established
+		controlChannel:  nil,
 		usageMonitor:    web.NewDataStore(fmt.Sprintf(":%v", config.WebPort), ctx, config.SnifferLog, config.Sniffer, &config.TunnelStatus, logger),
 		poolConnections: 0,
 		loadConnections: 0,
 		controlFlow:     make(chan struct{}, 100),
+		trafficBalancer: utils.NewTrafficBalancer(),
+		trafficObfuscator: utils.NewTrafficObfuscator(),
 	}
 
 	return client
@@ -130,52 +134,57 @@ func (c *TcpTransport) channelDialer() {
 				continue
 			}
 
-			// Sending security token
+			// Set a read deadline for the entire handshake process
+			handshakeDeadline := time.Now().Add(5 * time.Second)
+			if err := tunnelTCPConn.SetReadDeadline(handshakeDeadline); err != nil {
+				c.logger.Errorf("failed to set handshake deadline: %v", err)
+				tunnelTCPConn.Close()
+				time.Sleep(c.config.RetryInterval)
+				continue
+			}
+
+			// Sending security token with explicit signal type
 			err = utils.SendBinaryTransportString(tunnelTCPConn, c.config.Token, utils.SG_Chan)
 			if err != nil {
 				c.logger.Errorf("failed to send security token: %v", err)
 				tunnelTCPConn.Close()
+				time.Sleep(c.config.RetryInterval)
 				continue
 			}
 
-			// Set a read deadline for the token response
-			if err := tunnelTCPConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				c.logger.Errorf("failed to set read deadline: %v", err)
-				tunnelTCPConn.Close()
-				continue
-			}
-
-			// Receive response
-			message, _, err := utils.ReceiveBinaryTransportString(tunnelTCPConn)
+			// Receive response with signal validation
+			message, signal, err := utils.ReceiveBinaryTransportString(tunnelTCPConn)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					c.logger.Warn("timeout while waiting for control channel response")
 				} else {
 					c.logger.Errorf("failed to receive control channel response: %v", err)
 				}
-				tunnelTCPConn.Close() // Close connection on error or timeout
+				tunnelTCPConn.Close()
 				time.Sleep(c.config.RetryInterval)
 				continue
 			}
-			// Resetting the deadline (removes any existing deadline)
+
+			// Validate both token and signal type
+			if message != c.config.Token || signal != utils.SG_Chan {
+				c.logger.Errorf("invalid handshake - Token match: %v, Signal match: %v", 
+					message == c.config.Token, signal == utils.SG_Chan)
+				tunnelTCPConn.Close()
+				time.Sleep(c.config.RetryInterval)
+				continue
+			}
+
+			// Clear the deadline after successful handshake
 			tunnelTCPConn.SetReadDeadline(time.Time{})
 
-			if message == c.config.Token {
-				c.controlChannel = tunnelTCPConn
-				c.logger.Info("control channel established successfully")
+			c.controlChannel = tunnelTCPConn
+			c.logger.Info("control channel established successfully")
 
-				c.config.TunnelStatus = "Connected (TCP)"
-				go c.poolMaintainer()
-				go c.channelHandler()
+			c.config.TunnelStatus = "Connected (TCP)"
+			go c.poolMaintainer()
+			go c.channelHandler()
 
-				return
-
-			} else {
-				c.logger.Errorf("invalid token received. Expected: %s, Received: %s. Retrying...", c.config.Token, message)
-				tunnelTCPConn.Close() // Close connection if the token is invalid
-				time.Sleep(c.config.RetryInterval)
-				continue
-			}
+			return
 		}
 	}
 }
@@ -246,68 +255,58 @@ func (c *TcpTransport) poolMaintainer() {
 }
 
 func (c *TcpTransport) channelHandler() {
-	msgChan := make(chan byte, 1000)
-
-	// Goroutine to handle the blocking ReceiveBinaryString
-	go func() {
-		for {
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-				msg, err := utils.ReceiveBinaryByte(c.controlChannel)
-				if err != nil {
-					if c.cancel != nil {
-						c.logger.Error("failed to read from control channel. ", err)
-						go c.Restart()
-					}
-					return
-				}
-				msgChan <- msg
-			}
+	defer func() {
+		if c.controlChannel != nil {
+			c.controlChannel.Close()
 		}
+		c.Restart()
 	}()
 
-	// Main loop to listen for context cancellation or received messages
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = utils.SendBinaryByte(c.controlChannel, utils.SG_Closed)
 			return
+		default:
+			message, signal, err := utils.ReceiveBinaryTransportString(c.controlChannel)
+			if err != nil {
+				c.logger.Errorf("control channel error: %v", err)
+				return
+			}
 
-		case msg := <-msgChan:
-			switch msg {
-			case utils.SG_Chan:
-				atomic.AddInt32(&c.loadConnections, 1)
+			// Validate the received signal
+			if !validateSignal(signal) {
+				c.logger.Errorf("received invalid signal: %d", signal)
+				continue
+			}
 
-				select {
-				case <-c.controlFlow: // Do nothing
-
-				default:
-					c.logger.Debug("channel signal received, initiating tunnel dialer")
-					go c.tunnelDialer()
+			switch signal {
+			case utils.SG_HB:
+				// Handle heartbeat
+				err = utils.SendBinaryTransportString(c.controlChannel, message, utils.SG_HB)
+				if err != nil {
+					c.logger.Errorf("failed to send heartbeat response: %v", err)
+					return
 				}
 
-			case utils.SG_HB:
-				c.logger.Debug("heartbeat signal received successfully")
+			case utils.SG_Chan:
+				// Handle channel request
+				c.controlFlow <- struct{}{}
 
 			case utils.SG_Closed:
-				c.logger.Warn("control channel has been closed by the server")
-				go c.Restart()
+				// Handle closed signal
+				c.logger.Info("received close signal from server")
 				return
 
-			case utils.SG_RTT:
-				err := utils.SendBinaryByte(c.controlChannel, utils.SG_RTT)
+			case utils.SG_Ping:
+				// Handle ping
+				err = utils.SendBinaryTransportString(c.controlChannel, message, utils.SG_Ping)
 				if err != nil {
-					c.logger.Error("failed to send RTT signal, restarting client: ", err)
-					go c.Restart()
+					c.logger.Errorf("failed to send ping response: %v", err)
 					return
 				}
 
 			default:
-				c.logger.Errorf("unexpected response from channel: %v.", msg)
-				go c.Restart()
-				return
+				c.logger.Warnf("unhandled signal type: %d", signal)
 			}
 		}
 	}
@@ -375,5 +374,31 @@ func (c *TcpTransport) localDialer(tcpConn net.Conn, remoteAddr string, port int
 
 	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
 
-	utils.TCPConnectionHandler(tcpConn, localConnection, c.logger, c.usageMonitor, port, c.config.Sniffer)
+	// Create traffic handlers
+	balancer := utils.NewTrafficBalancer()
+	obfuscator := utils.NewTrafficObfuscator()
+
+	// Create obfuscated writers and readers
+	obfLocalWriter := obfuscator.NewObfuscatedWriter(localConnection)
+	obfRemoteWriter := obfuscator.NewObfuscatedWriter(tcpConn)
+	obfLocalReader := obfuscator.NewObfuscatedReader(localConnection)
+	obfRemoteReader := obfuscator.NewObfuscatedReader(tcpConn)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Handle upload (local to remote) with balancing and obfuscation
+	go func() {
+		defer wg.Done()
+		balancer.BalancedCopy(obfRemoteWriter, obfLocalReader)
+	}()
+
+	// Handle download (remote to local) with balancing and obfuscation
+	go func() {
+		defer wg.Done()
+		balancer.BalancedCopy(obfLocalWriter, obfRemoteReader)
+	}()
+
+	// Wait for both directions to complete
+	wg.Wait()
 }
