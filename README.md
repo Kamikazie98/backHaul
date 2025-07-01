@@ -1,4 +1,4 @@
-# Backhaul
+# Backhaul customized for xray-core
 
 A high-performance tunnel service with multiple transport protocols support.
 
