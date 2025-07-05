@@ -351,64 +351,135 @@ func (c *TcpMuxTransport) tunnelDialer() {
 
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
+	// defer atomic.AddInt32(&c.poolConnections, -1) // This will be handled by handleSession defer
 
 	c.handleSession(tunnelConn)
 }
 
 func (c *TcpMuxTransport) handleSession(tunnelConn net.Conn) {
-	defer func() {
-		atomic.AddInt32(&c.poolConnections, -1)
-	}()
+	defer atomic.AddInt32(&c.poolConnections, -1) // Decrement when session ends
+	defer tunnelConn.Close()                      // Ensure underlying connection is closed
 
-	// SMUX server
-	session, err := smux.Server(tunnelConn, c.smuxConfig)
+	// SMUX client session (since this is client code, it should be smux.Client)
+	session, err := smux.Client(tunnelConn, c.smuxConfig)
 	if err != nil {
-		c.logger.Errorf("failed to create mux session: %v", err)
+		c.logger.Errorf("failed to create mux client session: %v", err)
 		return
 	}
+	defer session.Close() // Ensure session is closed when handleSession exits
 
 	for {
 		select {
 		case <-c.ctx.Done():
+			c.logger.Debug("context done, closing session")
 			return
 		default:
+			// Client opens a stream to the server when server signals (via control channel)
+			// or when server initiates a stream for relay.
+			// In this model, the server opens a stream (session.AcceptStream on server),
+			// and the client accepts it here.
 			stream, err := session.AcceptStream()
 			if err != nil {
-				c.logger.Trace("session is closed: ", err)
-				session.Close()
-				return
+				if !session.IsClosed() {
+					c.logger.Errorf("failed to accept stream: %v, session active: %v", err, !session.IsClosed())
+				} else {
+					c.logger.Debug("session closed, cannot accept further streams")
+				}
+				return // Session is likely problematic or closed, exit handler.
 			}
+			c.logger.Debugf("accepted new stream %d from server", stream.ID())
 
-			remoteAddr, err := utils.ReceiveBinaryString(stream)
-			if err != nil {
-				c.logger.Errorf("unable to get port from stream connection %s: %v", tunnelConn.RemoteAddr().String(), err)
+			// Perform the new relay handshake over the accepted stream
+			// 1. Receive SG_RELAY_READY
+			// Set a deadline for receiving the signal
+			if err := stream.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				c.logger.Errorf("stream %d: failed to set read deadline for SG_RELAY_READY: %v", stream.ID(), err)
 				stream.Close()
 				continue
 			}
 
-			go c.localDialer(stream, remoteAddr)
+			initialSignal, err := utils.ReceiveBinaryByte(stream) // stream implements net.Conn
+			if err != nil {
+				c.logger.Errorf("stream %d: failed to receive initial signal: %v", stream.ID(), err)
+				stream.Close()
+				continue
+			}
+
+			if err := stream.SetReadDeadline(time.Time{}); err != nil { // Clear deadline
+				c.logger.Warnf("stream %d: failed to clear read deadline: %v", stream.ID(), err)
+			}
+
+			if initialSignal != utils.SG_RELAY_READY {
+				c.logger.Errorf("stream %d: received unexpected initial signal %X instead of SG_RELAY_READY", stream.ID(), initialSignal)
+				stream.Close()
+				continue
+			}
+			c.logger.Debugf("stream %d: received SG_RELAY_READY", stream.ID())
+
+			// 2. Receive the destination address string
+			destinationAddr, err := utils.ReceiveBinaryString(stream)
+			if err != nil {
+				c.logger.Errorf("stream %d: failed to receive destination address: %v", stream.ID(), err)
+				stream.Close()
+				continue
+			}
+			c.logger.Debugf("stream %d: received destination address '%s'", stream.ID(), destinationAddr)
+
+			go c.localDialer(stream, destinationAddr, true) // true for isRelaySetup
 		}
 	}
 }
 
-func (c *TcpMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
-	// Create traffic handlers optimized for xray-core protocols
-	balancer := utils.NewXrayBalancer()
-	obfuscator := utils.NewTrafficObfuscator()
-
-	// Establish local connection
-	localConn, err := net.DialTimeout("tcp", remoteAddr, c.config.DialTimeOut)
+func (c *TcpMuxTransport) localDialer(stream *smux.Stream, destinationAddrRaw string, isRelaySetup bool) {
+	// Resolve destination address
+	// ResolveRemoteAddr is in client/transport/shared.go, ensure it's suitable or adapt
+	port, resolvedAddr, err := ResolveRemoteAddr(destinationAddrRaw)
 	if err != nil {
-		c.logger.Errorf("failed to connect to local address %s: %v", remoteAddr, err)
+		c.logger.Errorf("stream %d: failed to resolve remote port from destination '%s': %v", stream.ID(), destinationAddrRaw, err)
 		stream.Close()
 		return
 	}
-	defer func() {
-		localConn.Close()
-		balancer.Close() // Ensure balancer is closed
-	}()
 
-	// Set TCP options for optimal performance with xray-core
+	finalDialHost := resolvedAddr
+	if finalDialHost == "" {
+		finalDialHost = "127.0.0.1" // Default to localhost
+	}
+	fullDialAddr := fmt.Sprintf("%s:%d", finalDialHost, port)
+
+	// Create traffic handlers optimized for xray-core protocols
+	// These should be instance members if they have state that needs to be shared,
+	// or ensure they are lightweight to create per stream.
+	// For now, assuming xrayBalancer and trafficObfuscator are fine as instance members.
+	// If they maintain per-connection state, new instances might be needed.
+	// The current TCP implementation creates them per connection (balancer, obfuscator).
+	// Let's stick to that pattern for consistency if they are stateful.
+	balancer := utils.NewXrayBalancer() // Create new balancer for each stream
+	obfuscator := utils.NewTrafficObfuscator() // Create new obfuscator for each stream
+
+	// Establish local connection
+	localConn, err := net.DialTimeout("tcp", fullDialAddr, c.config.DialTimeOut)
+	if err != nil {
+		c.logger.Errorf("stream %d: failed to connect to local address %s: %v", stream.ID(), fullDialAddr, err)
+		stream.Close()
+		return
+	}
+	// Defer closing localConn and stream until the copy operations are done.
+	// balancer.Close() is not needed as it's stateless or managed internally by copy.
+
+	c.logger.Debugf("stream %d: connected to local service %s successfully", stream.ID(), fullDialAddr)
+
+	if isRelaySetup {
+		// 3. Send SG_RELAY_ACK back to server over the stream
+		if err := utils.SendBinaryByte(stream, utils.SG_RELAY_ACK); err != nil {
+			c.logger.Errorf("stream %d: failed to send SG_RELAY_ACK to server: %v", stream.ID(), err)
+			localConn.Close()
+			stream.Close()
+			return
+		}
+		c.logger.Debugf("stream %d: sent SG_RELAY_ACK to server", stream.ID())
+	}
+
+	// Set TCP options for optimal performance with xray-core (on localConn)
 	if tcpConn, ok := localConn.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)                     // Enable TCP_NODELAY
 		tcpConn.SetKeepAlive(true)                   // Enable keep-alive
@@ -433,12 +504,16 @@ func (c *TcpMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
 	// Handle upload (local to remote) with synchronized balancing
 	go func() {
 		defer wg.Done()
+		defer stream.Close()
+		defer localConn.Close()
 		balancer.BalancedCopy(obfStreamWriter, obfLocalReader)
 	}()
 
 	// Handle download (remote to local) with synchronized balancing
 	go func() {
 		defer wg.Done()
+		defer stream.Close()
+		defer localConn.Close()
 		balancer.BalancedCopy(obfLocalWriter, obfStreamReader)
 	}()
 

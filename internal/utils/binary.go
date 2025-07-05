@@ -9,6 +9,21 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// Signal constants
+const (
+	SG_Chan   byte = 0x01 // Channel related signal
+	SG_HB     byte = 0x02 // Heartbeat signal
+	SG_Closed byte = 0x03 // Connection closed signal
+	SG_TCP    byte = 0x04 // TCP transport signal
+	SG_UDP    byte = 0x05 // UDP transport signal
+	SG_Ping   byte = 0x06 // Ping signal
+	SG_RTT    byte = 0x07 // RTT measurement signal
+
+	// New signals for relay setup
+	SG_RELAY_READY byte = 0x0A // Server is ready to send relay destination
+	SG_RELAY_ACK   byte = 0x0B // Client has received destination and is ready
+)
+
 func SendBinaryString(conn interface{}, message string) error {
 	// Header size
 	const headerSize = 2

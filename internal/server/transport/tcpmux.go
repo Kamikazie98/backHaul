@@ -583,37 +583,104 @@ func (s *TcpMuxTransport) handleSession(session *smux.Session) {
 				return
 			}
 
-			// Send the target port over the tunnel connection
-			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
-				s.logger.Tracef("failed to send address over stream: %v", err)
-				// Put local connection back to local channel
-				s.localChannel <- incomingConn
+			stream, err := session.OpenStream()
+			if err != nil {
+				s.logger.Errorf("failed to open stream for %s: %v", incomingConn.remoteAddr, err)
+				s.handleStreamOpenError(&incomingConn, counter)
+				// s.handleSessionError will be called by the loop if session.OpenStream keeps failing, eventually closing the session.
+				continue // Try to get another incomingConn for this session
+			}
+
+			// Perform the new relay handshake over the stream
+			// 1. Send SG_RELAY_READY
+			if err := utils.SendBinaryByte(stream, utils.SG_RELAY_READY); err != nil {
+				s.logger.Errorf("failed to send SG_RELAY_READY over stream for %s: %v", incomingConn.remoteAddr, err)
+				stream.Close()
+				s.handleStreamOpenError(&incomingConn, counter) // Put incomingConn back and release counter
 				continue
 			}
 
+			// 2. Send the target remoteAddr
+			if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
+				s.logger.Errorf("failed to send remoteAddr over stream for %s: %v", incomingConn.remoteAddr, err)
+				stream.Close()
+				s.handleStreamOpenError(&incomingConn, counter)
+				continue
+			}
+
+			// 3. Wait for SG_RELAY_ACK
+			ackDeadline := time.Now().Add(5 * time.Second)
+			if err := stream.SetReadDeadline(ackDeadline); err != nil {
+				s.logger.Errorf("failed to set read deadline for SG_RELAY_ACK on stream for %s: %v", incomingConn.remoteAddr, err)
+				stream.Close()
+				s.handleStreamOpenError(&incomingConn, counter)
+				continue
+			}
+
+			ackSignal, err := utils.ReceiveBinaryByte(stream) // Pass stream as net.Conn equivalent
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					s.logger.Warnf("timeout waiting for SG_RELAY_ACK on stream for %s", incomingConn.remoteAddr)
+				} else {
+					s.logger.Errorf("failed to receive SG_RELAY_ACK on stream for %s: %v", incomingConn.remoteAddr, err)
+				}
+				stream.Close()
+				s.handleStreamOpenError(&incomingConn, counter)
+				continue
+			}
+
+			if err := stream.SetReadDeadline(time.Time{}); err != nil { // Clear deadline
+				s.logger.Warnf("failed to clear read deadline on stream for %s: %v", incomingConn.remoteAddr, err)
+			}
+
+			if ackSignal != utils.SG_RELAY_ACK {
+				s.logger.Errorf("received invalid signal %X instead of SG_RELAY_ACK on stream for %s", ackSignal, incomingConn.remoteAddr)
+				stream.Close()
+				s.handleStreamOpenError(&incomingConn, counter)
+				continue
+			}
+
+			s.logger.Debugf("smux relay handshake complete for %s over stream %d", incomingConn.remoteAddr, stream.ID())
+
 			// Handle data exchange between connections
-			go func() {
-				utils.TCPConnectionHandler(stream, incomingConn.conn, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+			go func(s_stream *smux.Stream, s_incomingConn LocalTCPConn, s_counter chan struct{}) {
+				defer s_stream.Close() // Ensure stream is closed
+				defer s_incomingConn.conn.Close() // Ensure user connection is closed
+				utils.TCPConnectionHandler(s_stream, s_incomingConn.conn, s.logger, s.usageMonitor, s_incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 				atomic.AddInt32(&s.streamCounter, -1)
-				<-counter // read signal from the channel
-			}()
+				<-s_counter // read signal from the channel
+			}(stream, incomingConn, counter)
+
 		}
 	}
 }
 
-func (s *TcpMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {
-	s.logger.Tracef("failed to handle session: %v", err)
 
-	// decrease session value
+// handleStreamOpenError is called when opening a stream or the initial handshake fails.
+// It puts the incomingConn back to the localChannel and releases the counter.
+func (s *TcpMuxTransport) handleStreamOpenError(incomingConn *LocalTCPConn, counter chan struct{}) {
+	select {
+	case s.localChannel <- *incomingConn:
+		s.logger.Debugf("put incoming connection for %s back to localChannel", incomingConn.remoteAddr)
+	default:
+		s.logger.Warnf("localChannel full, discarding incoming connection for %s", incomingConn.remoteAddr)
+		incomingConn.conn.Close() // Close if can't requeue
+		atomic.AddInt32(&s.streamCounter, -1) // Decrement if discarded
+	}
+	<-counter // Release the counter slot
+}
+
+
+// handleSessionError is called when a session-level error occurs (e.g., session.OpenStream fails repeatedly, or session itself is dying)
+func (s *TcpMuxTransport) handleSessionError(err error) {
+	s.logger.Tracef("session error: %v", err)
 	atomic.AddInt32(&s.sessionCounter, -1)
 
-	// Put local connection back to local channel
-	s.localChannel <- *incomingConn
-
-	// Attempt to request a new connection
+	// No incomingConn to put back here as this is a session level issue.
+	// Requesting a new connection might be appropriate if the session died prematurely.
 	select {
 	case s.reqNewConnChan <- struct{}{}:
 	default:
-		s.logger.Warn("request new connection channel is full")
+		s.logger.Warn("request new connection channel is full while handling session error")
 	}
 }

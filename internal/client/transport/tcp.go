@@ -328,61 +328,101 @@ func (c *TcpTransport) tunnelDialer() {
 
 	// Increment active connections counter
 	atomic.AddInt32(&c.poolConnections, 1)
+	defer atomic.AddInt32(&c.poolConnections, -1) // Ensure this is decremented
 
-	// Attempt to receive the remote address from the tunnel server
-	remoteAddr, transport, err := utils.ReceiveBinaryTransportString(tcpConn)
-
-	// Decrement active connections after successful or failed connection
-	atomic.AddInt32(&c.poolConnections, -1)
-
-	if err != nil {
-		c.logger.Debugf("failed to receive port from tunnel connection %s: %v", tcpConn.RemoteAddr().String(), err)
+	// Set a deadline for the initial part of the relay handshake
+	initialHandshakeDeadline := time.Now().Add(5 * time.Second)
+	if err := tcpConn.SetReadDeadline(initialHandshakeDeadline); err != nil {
+		c.logger.Errorf("failed to set read deadline for initial signal: %v", err)
 		tcpConn.Close()
 		return
 	}
 
-	// Extract the port from the received address
-	port, resolvedAddr, err := ResolveRemoteAddr(remoteAddr)
+	// 1. Receive initial signal (SG_RELAY_READY or other)
+	initialSignal, err := utils.ReceiveBinaryByte(tcpConn)
 	if err != nil {
-		c.logger.Infof("failed to resolve remote port: %v", err)
-		tcpConn.Close() // Close the connection on error
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			c.logger.Warnf("timeout waiting for initial signal from server on %s", tcpConn.RemoteAddr().String())
+		} else {
+			c.logger.Errorf("failed to receive initial signal from server %s: %v", tcpConn.RemoteAddr().String(), err)
+		}
+		tcpConn.Close()
 		return
 	}
 
-	switch transport {
-	case utils.SG_TCP:
-		// Dial local server using the received address
-		c.localDialer(tcpConn, resolvedAddr, port)
+	// Clear the deadline after receiving the initial signal
+	if err := tcpConn.SetReadDeadline(time.Time{}); err != nil {
+		c.logger.Warnf("failed to clear read deadline after initial signal: %v", err)
+		// Not fatal, but log it
+	}
 
-	case utils.SG_UDP:
-		UDPDialer(tcpConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
+	switch initialSignal {
+	case utils.SG_RELAY_READY:
+		c.logger.Debugf("received SG_RELAY_READY from server %s", tcpConn.RemoteAddr().String())
+		// 2. Receive the destination address string
+		destinationAddr, err := utils.ReceiveBinaryString(tcpConn)
+		if err != nil {
+			c.logger.Errorf("failed to receive destination address from server %s: %v", tcpConn.RemoteAddr().String(), err)
+			tcpConn.Close()
+			return
+		}
+
+		port, resolvedAddr, err := ResolveRemoteAddr(destinationAddr)
+		if err != nil {
+			c.logger.Infof("failed to resolve remote port from destination '%s': %v", destinationAddr, err)
+			tcpConn.Close()
+			return
+		}
+		c.logger.Debugf("received destination %s (resolved to %s:%d) from server", destinationAddr, resolvedAddr, port)
+		c.localDialer(tcpConn, resolvedAddr, port, true) // true for isRelaySetup
+
+	// case utils.SG_UDP: // Example if other direct modes were added
+	// UDPDialer(tcpConn, resolvedAddr, c.logger, c.usageMonitor, port, c.config.Sniffer)
+	// This would need its own way to get resolvedAddr and port if not using SG_RELAY_READY
 
 	default:
-		c.logger.Error("undefined transport. close the connection.")
+		c.logger.Errorf("received unexpected initial signal %X from server %s. Closing connection.", initialSignal, tcpConn.RemoteAddr().String())
 		tcpConn.Close()
 	}
 }
 
-func (c *TcpTransport) localDialer(tcpConn net.Conn, remoteAddr string, port int) {
+func (c *TcpTransport) localDialer(tunnelSideConn net.Conn, destinationAddr string, port int, isRelaySetup bool) {
 	// Set Default S,R buffer to 32kb also enabling nodelay on send side of local network ( receive side should be handled by xray)
-	localConnection, err := TcpDialer(c.ctx, remoteAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 1, 32*1024, 32*1024)
-	if err != nil {
-		c.logger.Errorf("local dialer: %v", err)
-		tcpConn.Close()
-		return
+	// Construct the full address for dialing
+	fullDestinationAddr := fmt.Sprintf("%s:%d", destinationAddr, port)
+	if net.ParseIP(destinationAddr) == nil { // if destinationAddr is not an IP, it might already contain port
+		fullDestinationAddr = destinationAddr
 	}
 
-	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
+
+	localServiceConn, err := TcpDialer(c.ctx, fullDestinationAddr, c.config.DialTimeOut, c.config.KeepAlive, true, 1, 32*1024, 32*1024)
+	if err != nil {
+		c.logger.Errorf("local dialer to %s: %v", fullDestinationAddr, err)
+		tunnelSideConn.Close()
+		return
+	}
+	c.logger.Debugf("connected to local service %s successfully", fullDestinationAddr)
+
+	if isRelaySetup {
+		// 3. Send SG_RELAY_ACK back to server
+		if err := utils.SendBinaryByte(tunnelSideConn, utils.SG_RELAY_ACK); err != nil {
+			c.logger.Errorf("failed to send SG_RELAY_ACK to server %s: %v", tunnelSideConn.RemoteAddr().String(), err)
+			localServiceConn.Close()
+			tunnelSideConn.Close()
+			return
+		}
+		c.logger.Debugf("sent SG_RELAY_ACK to server %s", tunnelSideConn.RemoteAddr().String())
+	}
 
 	// Create traffic handlers
 	balancer := utils.NewTrafficBalancer()
-	obfuscator := utils.NewTrafficObfuscator()
+	obfuscator := utils.NewTrafficObfuscator() // Assuming these are safe to create multiple times or lightweight
 
 	// Create obfuscated writers and readers
-	obfLocalWriter := obfuscator.NewObfuscatedWriter(localConnection)
-	obfRemoteWriter := obfuscator.NewObfuscatedWriter(tcpConn)
-	obfLocalReader := obfuscator.NewObfuscatedReader(localConnection)
-	obfRemoteReader := obfuscator.NewObfuscatedReader(tcpConn)
+	obfLocalWriter := obfuscator.NewObfuscatedWriter(localServiceConn)
+	obfRemoteWriter := obfuscator.NewObfuscatedWriter(tunnelSideConn)
+	obfLocalReader := obfuscator.NewObfuscatedReader(localServiceConn)
+	obfRemoteReader := obfuscator.NewObfuscatedReader(tunnelSideConn)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -390,15 +430,19 @@ func (c *TcpTransport) localDialer(tcpConn net.Conn, remoteAddr string, port int
 	// Handle upload (local to remote) with balancing and obfuscation
 	go func() {
 		defer wg.Done()
+		defer localServiceConn.Close() // Ensure local connection is closed when copy finishes
+		defer tunnelSideConn.Close() // Ensure tunnel side is closed when copy finishes
 		balancer.BalancedCopy(obfRemoteWriter, obfLocalReader)
 	}()
 
 	// Handle download (remote to local) with balancing and obfuscation
 	go func() {
 		defer wg.Done()
+		defer localServiceConn.Close() // Ensure local connection is closed when copy finishes
+		defer tunnelSideConn.Close() // Ensure tunnel side is closed when copy finishes
 		balancer.BalancedCopy(obfLocalWriter, obfRemoteReader)
 	}()
 
-	// Wait for both directions to complete
-	wg.Wait()
+	// No wg.Wait() here as localDialer is typically called in a goroutine by tunnelDialer.
+	// The connections will be managed by the copy goroutines.
 }

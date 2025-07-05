@@ -532,17 +532,63 @@ func (s *TcpTransport) handleLoop() {
 					return
 
 				case tunnelConn := <-s.tunnelChannel:
-					// Send the target addr over the connection
-					if err := utils.SendBinaryTransportString(tunnelConn, localConn.remoteAddr, utils.SG_TCP); err != nil {
-						s.logger.Errorf("%v", err)
+					// New relay setup handshake
+					// 1. Send SG_RELAY_READY
+					if err := utils.SendBinaryByte(tunnelConn, utils.SG_RELAY_READY); err != nil {
+						s.logger.Errorf("failed to send SG_RELAY_READY to client: %v", err)
+						localConn.conn.Close()
+						tunnelConn.Close() // Close tunnelConn as well
+						continue loop      // Try with a new tunnelConn
+					}
+
+					// 2. Send the target remoteAddr
+					if err := utils.SendBinaryString(tunnelConn, localConn.remoteAddr); err != nil {
+						s.logger.Errorf("failed to send remoteAddr to client: %v", err)
+						localConn.conn.Close()
 						tunnelConn.Close()
 						continue loop
 					}
 
+					// 3. Wait for SG_RELAY_ACK
+					// Set a deadline for receiving the ACK
+					ackDeadline := time.Now().Add(5 * time.Second)
+					if err := tunnelConn.SetReadDeadline(ackDeadline); err != nil {
+						s.logger.Errorf("failed to set read deadline for SG_RELAY_ACK: %v", err)
+						localConn.conn.Close()
+						tunnelConn.Close()
+						continue loop
+					}
+
+					ackSignal, err := utils.ReceiveBinaryByte(tunnelConn)
+					if err != nil {
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							s.logger.Warnf("timeout waiting for SG_RELAY_ACK from client for %s", localConn.remoteAddr)
+						} else {
+							s.logger.Errorf("failed to receive SG_RELAY_ACK from client for %s: %v", localConn.remoteAddr, err)
+						}
+						localConn.conn.Close()
+						tunnelConn.Close()
+						continue loop
+					}
+
+					// Clear the deadline
+					if err := tunnelConn.SetReadDeadline(time.Time{}); err != nil {
+						s.logger.Warnf("failed to clear read deadline after SG_RELAY_ACK: %v", err)
+						// Not fatal, but log it
+					}
+
+					if ackSignal != utils.SG_RELAY_ACK {
+						s.logger.Errorf("received invalid signal instead of SG_RELAY_ACK: %X", ackSignal)
+						localConn.conn.Close()
+						tunnelConn.Close()
+						continue loop
+					}
+
+					s.logger.Debugf("relay handshake complete for %s", localConn.remoteAddr)
+
 					// Handle data exchange between connections
 					go utils.TCPConnectionHandler(localConn.conn, tunnelConn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 					break loop
-
 				}
 			}
 		}
